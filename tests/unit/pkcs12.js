@@ -2,6 +2,7 @@ var ASSERT = require('assert');
 var forge = require('../../lib/forge');
 var PKCS12 = require('../../lib/pkcs12');
 var ASN1 = require('../../lib/asn1');
+var MD = require('../../lib/md.all');
 var PEM = require('../../lib/pem');
 var PKI = require('../../lib/pki');
 var UTIL = require('../../lib/util');
@@ -286,6 +287,78 @@ var UTIL = require('../../lib/util');
       };
       var pem = PEM.encode(msg);
       ASSERT.equal(pem, _data.p12ecdsaCert);
+    });
+
+    describe('MAC corruption', function() {
+      // see CVE-2025-12816
+      var correctPw = 'correct-horse-battery-staple';
+      var wrongPw = 'wrong-password';
+      var legit;
+
+      /**
+       * Build a minimal certificate-only PKCS#12 (PFX) with a MAC.
+       */
+      function buildCertOnlyPfxWithMac(password) {
+        var keys = PKI.rsa.generateKeyPair({bits: 1024, e: 0x10001});
+        var cert = PKI.createCertificate();
+        cert.publicKey = keys.publicKey;
+        cert.serialNumber = '01';
+        cert.validity.notBefore = new Date();
+        cert.validity.notAfter = new Date();
+        cert.validity.notAfter.setFullYear(
+          cert.validity.notBefore.getFullYear() + 1);
+        cert.setSubject([{name: 'commonName', value: 'p12-demo'}]);
+        cert.setIssuer([{name: 'commonName', value: 'p12-demo'}]);
+        cert.sign(keys.privateKey, MD.sha256.create());
+
+        return PKCS12.toPkcs12Asn1(
+          null,
+          cert,
+          password,
+          {useMac: true, count: 2048, saltSize: 8}
+        );
+      }
+
+      /**
+       * Replace macData node with arbitrary junk.
+       */
+      function corruptMacData(pfxAsn1) {
+        var clone = ASN1.fromDer(ASN1.toDer(pfxAsn1).getBytes());
+        // replace 3rd element (macData) with garbage node
+        clone.value[2] = ASN1.create(
+          ASN1.Class.UNIVERSAL,
+          ASN1.Type.OCTETSTRING,
+          false,
+          'JUNK'
+        );
+        return clone;
+      }
+
+      before(function() {
+        this.timeout(120000);
+        legit = buildCertOnlyPfxWithMac(correctPw);
+      });
+
+      it('should accept valid PFX with correct password', function() {
+        ASSERT.doesNotThrow(function() {
+          var obj = PKCS12.pkcs12FromAsn1(legit, true, correctPw);
+          ASSERT(obj, 'pkcs12FromAsn1 should return an object');
+        });
+      });
+
+      it('should reject valid PFX with wrong password (MAC mismatch)',
+        function() {
+          ASSERT.throws(function() {
+            PKCS12.pkcs12FromAsn1(legit, true, wrongPw);
+          }, /PKCS#12 MAC could not be verified. Invalid password?/);
+        });
+
+      it('should reject tampered PFX with corrupted macData', function() {
+        var tampered = corruptMacData(legit);
+        ASSERT.throws(function() {
+          PKCS12.pkcs12FromAsn1(tampered, true, wrongPw);
+        }, /Invalid PKCS#12. macData field present but MAC was not validated./);
+      });
     });
   });
 
